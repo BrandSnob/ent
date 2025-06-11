@@ -8,7 +8,9 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"entgo.io/ent/dialect"
@@ -31,12 +33,12 @@ func Open(dialect, source string) (*Driver, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewDriver(dialect, Conn{db}), nil
+	return NewDriver(dialect, Conn{db, dialect}), nil
 }
 
 // OpenDB wraps the given database/sql.DB method with a Driver.
 func OpenDB(dialect string, db *sql.DB) *Driver {
-	return NewDriver(dialect, Conn{db})
+	return NewDriver(dialect, Conn{db, dialect})
 }
 
 // DB returns the underlying *sql.DB instance.
@@ -67,7 +69,7 @@ func (d *Driver) BeginTx(ctx context.Context, opts *TxOptions) (dialect.Tx, erro
 		return nil, err
 	}
 	return &Tx{
-		Conn: Conn{tx},
+		Conn: Conn{tx, d.dialect},
 		Tx:   tx,
 	}, nil
 }
@@ -81,6 +83,42 @@ type Tx struct {
 	driver.Tx
 }
 
+// ctyVarsKey is the key used for attaching and reading the context variables.
+type ctxVarsKey struct{}
+
+// sessionVars holds sessions/transactions variables to set before every statement.
+type sessionVars struct {
+	vars []struct{ k, v string }
+}
+
+// WithVar returns a new context that holds the session variable to be executed before every query.
+func WithVar(ctx context.Context, name, value string) context.Context {
+	sv, _ := ctx.Value(ctxVarsKey{}).(sessionVars)
+	sv.vars = append(sv.vars, struct {
+		k, v string
+	}{
+		k: name,
+		v: value,
+	})
+	return context.WithValue(ctx, ctxVarsKey{}, sv)
+}
+
+// VarFromContext returns the session variable value from the context.
+func VarFromContext(ctx context.Context, name string) (string, bool) {
+	sv, _ := ctx.Value(ctxVarsKey{}).(sessionVars)
+	for _, s := range sv.vars {
+		if s.k == name {
+			return s.v, true
+		}
+	}
+	return "", false
+}
+
+// WithIntVar calls WithVar with the string representation of the value.
+func WithIntVar(ctx context.Context, name string, value int) context.Context {
+	return WithVar(ctx, name, strconv.Itoa(value))
+}
+
 // ExecQuerier wraps the standard Exec and Query methods.
 type ExecQuerier interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -90,21 +128,29 @@ type ExecQuerier interface {
 // Conn implements dialect.ExecQuerier given ExecQuerier.
 type Conn struct {
 	ExecQuerier
+	dialect string
 }
 
 // Exec implements the dialect.Exec method.
-func (c Conn) Exec(ctx context.Context, query string, args, v any) error {
+func (c Conn) Exec(ctx context.Context, query string, args, v any) (rerr error) {
 	argv, ok := args.([]any)
 	if !ok {
 		return fmt.Errorf("dialect/sql: invalid type %T. expect []any for args", v)
 	}
+	ex, cf, err := c.maySetVars(ctx)
+	if err != nil {
+		return err
+	}
+	if cf != nil {
+		defer func() { rerr = errors.Join(rerr, cf()) }()
+	}
 	switch v := v.(type) {
 	case nil:
-		if _, err := c.ExecContext(ctx, query, argv...); err != nil {
+		if _, err := ex.ExecContext(ctx, query, argv...); err != nil {
 			return err
 		}
 	case *sql.Result:
-		res, err := c.ExecContext(ctx, query, argv...)
+		res, err := ex.ExecContext(ctx, query, argv...)
 		if err != nil {
 			return err
 		}
@@ -125,12 +171,76 @@ func (c Conn) Query(ctx context.Context, query string, args, v any) error {
 	if !ok {
 		return fmt.Errorf("dialect/sql: invalid type %T. expect []any for args", args)
 	}
-	rows, err := c.QueryContext(ctx, query, argv...)
+	ex, cf, err := c.maySetVars(ctx)
 	if err != nil {
 		return err
 	}
+	rows, err := ex.QueryContext(ctx, query, argv...)
+	if err != nil {
+		if cf != nil {
+			err = errors.Join(err, cf())
+		}
+		return err
+	}
 	*vr = Rows{rows}
+	if cf != nil {
+		vr.ColumnScanner = rowsWithCloser{rows, cf}
+	}
 	return nil
+}
+
+// maySetVars sets the session variables before executing a query.
+func (c Conn) maySetVars(ctx context.Context) (ExecQuerier, func() error, error) {
+	sv, _ := ctx.Value(ctxVarsKey{}).(sessionVars)
+	if len(sv.vars) == 0 {
+		return c, nil, nil
+	}
+	var (
+		ex    ExecQuerier  // Underlying ExecQuerier.
+		cf    func() error // Close function.
+		reset []string     // Reset variables.
+		seen  = make(map[string]struct{}, len(sv.vars))
+	)
+	switch e := c.ExecQuerier.(type) {
+	case *sql.Tx:
+		ex = e
+	case *sql.DB:
+		conn, err := e.Conn(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		ex, cf = conn, conn.Close
+	}
+	for _, s := range sv.vars {
+		if _, ok := seen[s.k]; !ok {
+			switch c.dialect {
+			case dialect.Postgres:
+				reset = append(reset, fmt.Sprintf("RESET %s", s.k))
+			case dialect.MySQL:
+				reset = append(reset, fmt.Sprintf("SET %s = NULL", s.k))
+			}
+			seen[s.k] = struct{}{}
+		}
+		if _, err := ex.ExecContext(ctx, fmt.Sprintf("SET %s = '%s'", s.k, s.v)); err != nil {
+			if cf != nil {
+				err = errors.Join(err, cf())
+			}
+			return nil, nil, err
+		}
+	}
+	// If there are variables to reset, and we need to return the
+	// connection to the pool, we need to clean up the variables.
+	if cls := cf; cf != nil && len(reset) > 0 {
+		cf = func() error {
+			for _, q := range reset {
+				if _, err := ex.ExecContext(ctx, q); err != nil {
+					return errors.Join(err, cls())
+				}
+			}
+			return cls()
+		}
+	}
+	return ex, cf, nil
 }
 
 var _ dialect.Driver = (*Driver)(nil)
@@ -154,9 +264,8 @@ type (
 	TxOptions = sql.TxOptions
 )
 
-// NullScanner represents an sql.Scanner that may be null.
-// NullScanner implements the sql.Scanner interface so it can
-// be used as a scan destination, similar to the types above.
+// NullScanner implements the sql.Scanner interface such that it
+// can be used as a scan destination, similar to the types above.
 type NullScanner struct {
 	S     sql.Scanner
 	Valid bool // Valid is true if the Scan value is not NULL.
@@ -181,4 +290,16 @@ type ColumnScanner interface {
 	Next() bool
 	NextResultSet() bool
 	Scan(dest ...any) error
+}
+
+// rowsWithCloser wraps the ColumnScanner interface with a custom Close hook.
+type rowsWithCloser struct {
+	ColumnScanner
+	closer func() error
+}
+
+// Close closes the underlying ColumnScanner and calls the custom closer.
+func (r rowsWithCloser) Close() error {
+	err := r.ColumnScanner.Close()
+	return errors.Join(err, r.closer())
 }
